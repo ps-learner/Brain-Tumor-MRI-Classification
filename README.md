@@ -143,9 +143,7 @@ brain-tumor-mri-classification/
 │   ├── home_dashboard.png
 │   ├── dataset_explorer.png
 │   ├── model_results.png
-│   ├── mri_classifier_upload.png
-│   ├── mri_classifier_result.png
-│   └── gradcam_view.png
+│   └── about.png
 │
 └── data/
     └── .gitkeep
@@ -192,14 +190,17 @@ Use Grad-CAM outputs to answer:
 
 ## App Screenshots
 
-Add screenshots after running the Streamlit app:
+## Home Dashboard
+![Home Dashboard](screenshots/home_dashboard.png)
 
-- `screenshots/home_dashboard.png`
-- `screenshots/dataset_explorer.png`
-- `screenshots/model_results.png`
-- `screenshots/mri_classifier_upload.png`
-- `screenshots/mri_classifier_result.png`
-- `screenshots/gradcam_view.png`
+## Dataset Explorer
+![Dataset Explorer](screenshots/dataset_explorer.png)
+
+## Model Results
+![Model Results](screenshots/model_results.png)
+
+## About Page
+![About Page](screenshots/about.png)
 
 ---
 

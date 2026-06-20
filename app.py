@@ -92,15 +92,30 @@ def load_comparison():
         "Best For": ["Baseline", "Accuracy", "Speed", "Robustness"]
     })
 
+
 @st.cache_resource
 def load_model(model_name):
     path = os.path.join(MODEL_DIR, model_name)
+
+    print("Trying:", path)
+
     if os.path.exists(path):
+        print("Loading:", path)
         return tf.keras.models.load_model(path, compile=False)
-    fallback = os.path.join(MODEL_DIR, "best_model.h5")
+
+    fallback = os.path.join(MODEL_DIR, "best_model.keras")
+
+    print("Fallback:", fallback)
+
     if os.path.exists(fallback):
+        print("Loading fallback:", fallback)
         return tf.keras.models.load_model(fallback, compile=False)
+
     return None
+
+
+
+
 
 def preprocess_pil_image(img, target_size=(224, 224)):
     img = img.convert("RGB")
@@ -339,7 +354,7 @@ elif page == "🧠 MRI Classifier":
         if os.path.exists(os.path.join(MODEL_DIR, file_name)):
             available_models.append(file_name)
     if not available_models:
-        available_models = [meta.get("best_model", "best_model.h5")]
+        available_models = [meta.get("best_model", "best_model.keras")]
 
     selected_model_name = st.selectbox("Select Model", available_models)
     uploaded_file = st.file_uploader("Upload Brain MRI Image", type=["jpg", "jpeg", "png"])
