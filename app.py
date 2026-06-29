@@ -15,6 +15,10 @@ from tf_keras_vis.gradcam import Gradcam
 from tf_keras_vis.utils.model_modifiers import ReplaceToLinear
 from tf_keras_vis.utils.scores import CategoricalScore
 
+from tensorflow.keras.applications.efficientnet import preprocess_input as efficientnet_preprocess
+from tensorflow.keras.applications.mobilenet_v2 import preprocess_input as mobilenet_preprocess
+from tensorflow.keras.applications.inception_v3 import preprocess_input as inception_preprocess
+
 st.set_page_config(
     page_title="NeuroScan AI",
     page_icon="🧠",
@@ -93,36 +97,207 @@ def load_comparison():
     })
 
 
+# Define at module level so it registers exactly once per process — no stale class issues
+try:
+    @tf.keras.utils.register_keras_serializable(package='Custom')
+    class TrueDivide(tf.keras.layers.Layer):
+        def __init__(self, y=255.0, **kwargs):
+            super().__init__(**kwargs)
+            self.y = float(y)
+
+        def call(self, inputs):
+            return tf.cast(inputs, tf.float32) / self.y
+
+        def get_config(self):
+            config = super().get_config()
+            config.update({'y': self.y})
+            return config
+except Exception:
+    pass
+
+
+
+
 @st.cache_resource
 def load_model(model_name):
+    import h5py
+    import shutil
+
     path = os.path.join(MODEL_DIR, model_name)
 
-    print("Trying:", path)
 
-    if os.path.exists(path):
-        print("Loading:", path)
-        return tf.keras.models.load_model(path, compile=False)
+
+    # MobileNetV2/Inception also save a Subtract layer for the -127.5 part
+    # Register it so Keras doesn't choke on it
+
+
+    def clean_model_config(config_str):
+        config = json.loads(config_str)
+
+        def clean_layer(obj):
+            if isinstance(obj, dict):
+                obj.pop('quantization_config', None)
+
+                # For TrueDivide layers: ensure 'y' is in the layer config dict.
+                # MobileNet/Inception save TrueDivide with y=127.5 but sometimes
+                # the value ends up missing from config — extract it from inbound_nodes.
+                if obj.get('class_name') == 'TrueDivide':
+                    inner = obj.get('config', {})
+                    if 'y' not in inner:
+                        # Try to recover 'y' from inbound_nodes args
+                        y_val = _extract_y_from_inbound(obj.get('inbound_nodes', []))
+                        inner['y'] = y_val if y_val is not None else 255.0
+                        obj['config'] = inner
+                    # Strip positional floats from inbound_nodes entirely —
+                    # they cause "Only input tensors may be passed as positional args"
+                    if 'inbound_nodes' in obj:
+                        obj['inbound_nodes'] = _strip_float_args(obj['inbound_nodes'])
+
+                for v in obj.values():
+                    clean_layer(v)
+            elif isinstance(obj, list):
+                for item in obj:
+                    clean_layer(item)
+
+        def _extract_y_from_inbound(nodes):
+            """Recursively find a float (127.5 or 255.0) in inbound_nodes."""
+            if isinstance(nodes, list):
+                for item in nodes:
+                    result = _extract_y_from_inbound(item)
+                    if result is not None:
+                        return result
+            elif isinstance(nodes, dict):
+                for v in nodes.get('args', []):
+                    if isinstance(v, (int, float)) and v in (127.5, 255.0):
+                        return float(v)
+            elif isinstance(nodes, (int, float)) and nodes in (127.5, 255.0):
+                return float(nodes)
+            return None
+
+        def _strip_float_args(nodes):
+            """Remove raw float positional args from inbound_nodes call args."""
+            if isinstance(nodes, list):
+                return [_strip_float_args(item) for item in nodes]
+            elif isinstance(nodes, dict):
+                new_args = [a for a in nodes.get('args', [])
+                            if not (isinstance(a, (int, float)) and a in (127.5, 255.0))]
+                nodes['args'] = new_args
+                return nodes
+            return nodes
+
+        clean_layer(config)
+        return json.dumps(config).encode('utf-8')
+
+    if os.path.exists(path) and path.endswith('.h5'):
+        try:
+            tmp = tempfile.NamedTemporaryFile(suffix='.h5', delete=False)
+            tmp.close()
+            shutil.copy2(path, tmp.name)
+
+            with h5py.File(tmp.name, 'r+') as f:
+                if 'model_config' in f.attrs:
+                    patched = clean_model_config(f.attrs['model_config'])
+                    f.attrs['model_config'] = patched
+
+            return tf.keras.models.load_model(
+                tmp.name,
+                compile=False,
+                custom_objects={
+                    'TrueDivide': TrueDivide,
+                }
+            )
+        except Exception as e:
+            st.error(f"Could not load model: {e}")
+            return None
 
     fallback = os.path.join(MODEL_DIR, "best_model.keras")
-
-    print("Fallback:", fallback)
-
     if os.path.exists(fallback):
-        print("Loading fallback:", fallback)
         return tf.keras.models.load_model(fallback, compile=False)
-
     return None
 
 
 
 
 
-def preprocess_pil_image(img, target_size=(224, 224)):
+# def preprocess_pil_image(img, model_name, target_size=(224, 224)):
+#     img = img.convert("RGB")
+#     img = img.resize(target_size)
+#     arr = np.array(img).astype(np.float32)  # raw 0-255
+
+#     if "efficientnet" in model_name.lower() or \
+#        "mobilenet" in model_name.lower() or \
+#        "inception" in model_name.lower():
+#         # TrueDivide is baked inside these models as a layer — pass raw 0-255.
+#         # The model divides by 255 internally via the restored TrueDivide layer.
+#         arr_processed = arr.copy()
+#     else:
+#         # Custom CNN: trained on trainds_norm (externally /255, no TrueDivide inside).
+#         arr_processed = arr / 255.0
+
+#     return arr, arr_processed
+
+def preprocess_pil_image(img, model_name, target_size=(224, 224)):
     img = img.convert("RGB")
     img = img.resize(target_size)
-    arr = np.array(img).astype(np.float32)
-    arr_norm = arr / 255.0
-    return arr, arr_norm
+    arr = np.array(img).astype(np.float32)  # raw 0-255
+
+    # All transfer learning models (EfficientNet, MobileNet, Inception) have their
+    # preprocessing baked in as TrueDivide layers — pass raw 0-255 pixels.
+    # Custom CNN has no such layer — it was trained on externally /255 normalised data.
+    if "custom_cnn" in model_name.lower() or "cnn" in model_name.lower():
+        arr_processed = arr / 255.0
+    else:
+        arr_processed = arr.copy()  # raw 0-255 → model divides internally
+
+    return arr, arr_processed
+
+
+
+
+
+def get_gradcam(model, img_array, class_idx, model_name=""):
+    """
+    For transfer learning models (EfficientNet, MobileNet, Inception), the first
+    layer is TrueDivide which tf-keras-vis cannot differentiate through.
+    Solution: find the layer AFTER TrueDivide and build a sub-model from there,
+    passing already-divided pixels so gradients flow correctly.
+    """
+    try:
+        if "efficientnet" in model_name.lower() or \
+           "mobilenet" in model_name.lower() or \
+           "inception" in model_name.lower():
+
+            # Find the TrueDivide layer and skip past it
+            skip_after = None
+            for i, layer in enumerate(model.layers):
+                if "true_divide" in layer.name.lower() or \
+                   layer.__class__.__name__ == "TrueDivide":
+                    skip_after = i
+                    break
+
+            if skip_after is not None:
+                # Build sub-model: from layer AFTER TrueDivide to output
+                inner_input = model.layers[skip_after + 1].input
+                sub_model = tf.keras.Model(
+                    inputs=inner_input,
+                    outputs=model.output
+                )
+                # Pre-divide the input ourselves since TrueDivide is skipped
+                divided_input = img_array / 255.0
+                gradcam = Gradcam(sub_model, model_modifier=ReplaceToLinear(), clone=True)
+                score = CategoricalScore([class_idx])
+                cam = gradcam(score, divided_input)
+                return cam[0]
+
+        # Custom CNN and fallback: pass directly, works fine
+        gradcam = Gradcam(model, model_modifier=ReplaceToLinear(), clone=True)
+        score = CategoricalScore([class_idx])
+        cam = gradcam(score, img_array)
+        return cam[0]
+
+    except Exception as e:
+        raise e
+
 
 def overlay_heatmap(image_rgb, heatmap, alpha=0.4):
     heatmap = cv2.resize(heatmap, (image_rgb.shape[1], image_rgb.shape[0]))
@@ -131,11 +306,6 @@ def overlay_heatmap(image_rgb, heatmap, alpha=0.4):
     overlay = cv2.addWeighted(cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR), 1-alpha, heatmap_color, alpha, 0)
     return cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
 
-def get_gradcam(model, img_array, class_idx):
-    gradcam = Gradcam(model, model_modifier=ReplaceToLinear(), clone=True)
-    score = CategoricalScore([class_idx])
-    cam = gradcam(score, img_array)
-    return cam[0]
 
 def tumor_probability_chart(probs):
     df = pd.DataFrame({
@@ -365,8 +535,8 @@ elif page == "🧠 MRI Classifier":
             st.error("Model file not found. Please place trained models in the models/ folder.")
         else:
             img = Image.open(uploaded_file)
-            image_rgb, image_norm = preprocess_pil_image(img, (224, 224))
-            model_input = np.expand_dims(image_rgb.astype(np.float32), axis=0)
+            image_rgb, image_norm = preprocess_pil_image(img, selected_model_name)
+            model_input = np.expand_dims(image_norm, axis=0)
 
             probs = model.predict(model_input, verbose=0)[0]
             pred_idx = int(np.argmax(probs))
@@ -376,7 +546,7 @@ elif page == "🧠 MRI Classifier":
 
             col1, col2 = st.columns([1, 1.15])
             with col1:
-                st.image(image_rgb, caption="Uploaded MRI", use_container_width=True)
+                st.image(image_rgb.astype(np.uint8), caption="Uploaded MRI", use_container_width=True)
             with col2:
                 st.markdown(f"### Prediction: <span class='red-accent'>{info['name']}</span>", unsafe_allow_html=True)
                 st.markdown(f"**Severity:** {info['severity']}")
@@ -388,13 +558,13 @@ elif page == "🧠 MRI Classifier":
             st.plotly_chart(tumor_probability_chart(probs), use_container_width=True)
 
             try:
-                heatmap = get_gradcam(model, model_input, pred_idx)
-                overlay = overlay_heatmap(image_rgb, heatmap)
+                heatmap = get_gradcam(model, model_input, pred_idx,model_name=selected_model_name)
+                overlay = overlay_heatmap(image_rgb.astype(np.uint8), heatmap)
                 g1, g2 = st.columns(2)
                 with g1:
-                    st.image(image_rgb, caption="Original MRI", use_container_width=True)
+                    st.image(image_rgb.astype(np.uint8), caption="Original MRI", use_container_width=True)
                 with g2:
-                    st.image(overlay, caption="Grad-CAM Overlay", use_container_width=True)
+                    st.image(overlay.astype(np.uint8), caption="Grad-CAM Overlay", use_container_width=True)
             except Exception as e:
                 st.warning(f"Grad-CAM could not be generated for this model: {e}")
 
